@@ -1,0 +1,17 @@
+# Node
+node_modules
+npm-debug.log*
+
+# Build output
+backend/dist
+mobile/.expo
+web/dist
+
+# Env
+.env
+backend/.env
+mobile/.env
+web/.env
+
+# macOS
+.DS_Store

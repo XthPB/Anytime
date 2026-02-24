@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "Privately",
+    "slug": "privately",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#081021"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.privately.app"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#081021"
+      },
+      "package": "com.privately.app"
+    },
+    "extra": {
+      "apiUrl": "${EXPO_PUBLIC_API_URL}"
+    }
+  }
+}
