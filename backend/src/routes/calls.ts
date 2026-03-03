@@ -21,7 +21,7 @@ const clearCallHistorySchema = z.object({
 export async function callRoutes(app: FastifyInstance): Promise<void> {
   app.get("/v1/calls/ice", { preHandler: [app.requireAuth] }, async (request, reply) => {
     try {
-      const result = await resolveCallIceServers();
+      const result = await resolveCallIceServers(request.user.sub);
       return {
         iceServers: result.iceServers,
         ttlSeconds: result.ttlSeconds,

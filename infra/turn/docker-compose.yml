@@ -1,0 +1,27 @@
+services:
+  coturn:
+    image: coturn/coturn:4.7
+    container_name: anytime-coturn
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    command:
+      - -n
+      - --fingerprint
+      - --lt-cred-mech
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SHARED_SECRET}
+      - --realm=${TURN_REALM}
+      - --listening-port=3478
+      - --listening-ip=0.0.0.0
+      - --relay-ip=0.0.0.0
+      - --external-ip=${TURN_PUBLIC_IP}
+      - --min-port=${TURN_MIN_RELAY_PORT}
+      - --max-port=${TURN_MAX_RELAY_PORT}
+      - --stale-nonce=600
+      - --no-multicast-peers
+      - --no-cli
+      - --no-tls
+      - --no-dtls
+      - --log-file=stdout

@@ -1,4 +1,5 @@
 import { env } from "../config.js";
+import { createHmac, randomBytes } from "node:crypto";
 
 type IceServerConfig = {
   urls: string | string[];
@@ -10,7 +11,7 @@ type IceServerConfig = {
 type TurnResponse = {
   iceServers: IceServerConfig[];
   ttlSeconds: number;
-  source: "default" | "static" | "twilio";
+  source: "default" | "static" | "twilio" | "coturn";
 };
 
 const DEFAULT_ICE_SERVERS: IceServerConfig[] = [
@@ -22,6 +23,13 @@ const DEFAULT_ICE_SERVERS: IceServerConfig[] = [
 const TWILIO_REFRESH_BUFFER_MS = 30_000;
 
 let cachedTwilio: { expiresAtMs: number; response: TurnResponse } | null = null;
+
+function parseTurnUrlsCsv(raw: string | undefined): string[] {
+  return (raw ?? "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
 
 function sanitizeIceServers(input: unknown): IceServerConfig[] {
   if (!Array.isArray(input)) return [];
@@ -50,10 +58,7 @@ function staticIceResponse(): TurnResponse | null {
     }
   }
 
-  const urls = (env.TURN_URLS ?? "")
-    .split(",")
-    .map((part) => part.trim())
-    .filter(Boolean);
+  const urls = parseTurnUrlsCsv(env.TURN_URLS);
 
   if (urls.length === 0) {
     return null;
@@ -70,6 +75,39 @@ function staticIceResponse(): TurnResponse | null {
     ],
     ttlSeconds: 3600,
     source: "static"
+  };
+}
+
+function sanitizeUsernamePart(input: string): string {
+  const cleaned = input.replace(/[^a-zA-Z0-9_-]/g, "");
+  return cleaned.length > 0 ? cleaned.slice(0, 48) : "anon";
+}
+
+function coturnIceResponse(userId: string): TurnResponse | null {
+  const urls = parseTurnUrlsCsv(env.TURN_URLS);
+  const sharedSecret = env.TURN_COTURN_SHARED_SECRET;
+  if (urls.length === 0 || !sharedSecret) {
+    return null;
+  }
+
+  const ttl = env.TURN_COTURN_TTL_SECONDS;
+  const expiresAt = Math.floor(Date.now() / 1000) + ttl;
+  const nonce = randomBytes(4).toString("hex");
+  const userToken = sanitizeUsernamePart(userId);
+  const username = `${expiresAt}:${env.TURN_COTURN_USER_PREFIX}:${userToken}:${nonce}`;
+  const credential = createHmac("sha1", sharedSecret).update(username).digest("base64");
+
+  return {
+    iceServers: [
+      ...DEFAULT_ICE_SERVERS,
+      {
+        urls,
+        username,
+        credential
+      }
+    ],
+    ttlSeconds: ttl,
+    source: "coturn"
   };
 }
 
@@ -131,10 +169,15 @@ async function twilioIceResponse(): Promise<TurnResponse | null> {
   return result;
 }
 
-export async function resolveCallIceServers(): Promise<TurnResponse> {
+export async function resolveCallIceServers(userId: string): Promise<TurnResponse> {
   if (env.TURN_PROVIDER === "twilio") {
     const twilio = await twilioIceResponse();
     if (twilio) return twilio;
+  }
+
+  if (env.TURN_PROVIDER === "coturn") {
+    const coturn = coturnIceResponse(userId);
+    if (coturn) return coturn;
   }
 
   if (env.TURN_PROVIDER === "static") {

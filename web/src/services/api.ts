@@ -77,7 +77,7 @@ export type SignalEnvelope = {
 export type CallIceConfig = {
   iceServers: RTCIceServer[];
   ttlSeconds: number;
-  source: "default" | "static" | "twilio";
+  source: "default" | "static" | "twilio" | "coturn";
 };
 
 async function request<T>(path: string, init: RequestInit = {}, token?: string): Promise<T> {
