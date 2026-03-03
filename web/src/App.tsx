@@ -1,4 +1,4 @@
-import { ChangeEvent, ClipboardEvent, MouseEvent as ReactMouseEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, ClipboardEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CallHistoryItem,
   Contact,
@@ -709,6 +709,7 @@ export default function App() {
 
   const sentPayloadCacheRef = useRef<Record<string, string>>({});
   const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const backupInputRef = useRef<HTMLInputElement | null>(null);
 
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -2515,6 +2516,13 @@ export default function App() {
     }
   }, [sendTypingPulse]);
 
+  const onComposerKeyDown = useCallback((event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key !== "Enter" || event.shiftKey) return;
+    if (event.nativeEvent.isComposing) return;
+    event.preventDefault();
+    void sendTextAction();
+  }, [sendTextAction]);
+
   const queueAttachments = useCallback(async (files: File[]) => {
     if (!selectedChat) {
       setStatus("Select a chat before adding attachments");
@@ -2571,11 +2579,19 @@ export default function App() {
   }, []);
 
   const onSelectImage = useCallback(async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
+    const files = Array.from(event.target.files ?? []);
     event.target.value = "";
 
-    if (!file) return;
-    await queueAttachments([file]);
+    if (files.length === 0) return;
+    await queueAttachments(files);
+  }, [queueAttachments]);
+
+  const onSelectFiles = useCallback(async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = "";
+
+    if (files.length === 0) return;
+    await queueAttachments(files);
   }, [queueAttachments]);
 
   const sendGifAction = useCallback(async () => {
@@ -3384,6 +3400,7 @@ export default function App() {
         <footer className="composer-bar">
           <div className="composer-tools">
             <button className="icon-btn" onClick={() => imageInputRef.current?.click()} disabled={!selectedChat}>Photo</button>
+            <button className="icon-btn" onClick={() => fileInputRef.current?.click()} disabled={!selectedChat}>File</button>
             <button className={`icon-btn ${showGifPicker ? "active" : ""}`} onClick={sendGifAction} disabled={!selectedChat}>GIF</button>
             {!recording ? (
               <button className="icon-btn" onClick={startRecording} disabled={!selectedChat}>Voice</button>
@@ -3406,8 +3423,9 @@ export default function App() {
           <textarea
             value={composer}
             onChange={(e) => onComposerChange(e.target.value)}
+            onKeyDown={onComposerKeyDown}
             onPaste={onComposerPaste}
-            placeholder={selectedChat ? "Type a message or paste image/file here" : "Select a chat first"}
+            placeholder={selectedChat ? "Type a message, paste a file, or press Enter to send" : "Select a chat first"}
             disabled={!selectedChat}
           />
 
@@ -3423,8 +3441,16 @@ export default function App() {
             ref={imageInputRef}
             type="file"
             accept="image/*"
+            multiple
             style={{ display: "none" }}
             onChange={onSelectImage}
+          />
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            style={{ display: "none" }}
+            onChange={onSelectFiles}
           />
         </footer>
 
