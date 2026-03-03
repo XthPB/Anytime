@@ -72,6 +72,8 @@ npm run dev
 5. Deploy. Railway uses `railway.json` + `backend/Dockerfile`.
 6. Optional scripted deploy: `./scripts/deploy-railway-backend.sh`
 7. Optional scripted web deploy: `./scripts/deploy-railway-web.sh`
+8. Optional scripted TURN env wiring for self-hosted Coturn:
+   - `./scripts/configure-railway-coturn.sh` (uses `TURN_DOMAIN` + `TURN_COTURN_SHARED_SECRET`)
 
 ## Mobile Run (iOS + Android)
 
@@ -149,3 +151,14 @@ Coturn REST auth model used by this app:
 - Coturn validates those credentials using the same shared secret (`use-auth-secret`).
 
 See `docs/turn-coturn-selfhost.md` for a production setup checklist.
+
+Quick bootstrap for a fresh VPS:
+
+```bash
+./scripts/bootstrap-coturn-host.sh \
+  --host <vps-ip-or-hostname> \
+  --user <ssh-user> \
+  --domain turn.your-domain.com \
+  --ssh-key ~/.ssh/id_ed25519 \
+  --enable-ufw
+```

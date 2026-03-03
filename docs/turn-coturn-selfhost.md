@@ -25,6 +25,19 @@ cp .env.example .env
 docker compose up -d
 ```
 
+Or bootstrap a fresh Ubuntu VPS over SSH:
+
+```bash
+./scripts/bootstrap-coturn-host.sh \
+  --host <vps-ip-or-hostname> \
+  --user <ssh-user> \
+  --domain turn.your-domain.com \
+  --ssh-key ~/.ssh/id_ed25519 \
+  --enable-ufw
+```
+
+The script installs Coturn, writes `/etc/turnserver.conf`, opens firewall ports, and prints the exact Railway env values to set.
+
 ## 3. Backend Configuration (Railway)
 
 Set these env vars on `anytime-backend`:
@@ -36,6 +49,15 @@ Set these env vars on `anytime-backend`:
 - `TURN_COTURN_USER_PREFIX=u`
 
 Then redeploy backend.
+
+Scripted env setup:
+
+```bash
+export RAILWAY_API_TOKEN=...
+export TURN_DOMAIN=turn.your-domain.com
+export TURN_COTURN_SHARED_SECRET=...
+./scripts/configure-railway-coturn.sh
+```
 
 ## 4. Validation
 
