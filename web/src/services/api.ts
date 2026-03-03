@@ -74,6 +74,12 @@ export type SignalEnvelope = {
   createdAt: string;
 };
 
+export type CallIceConfig = {
+  iceServers: RTCIceServer[];
+  ttlSeconds: number;
+  source: "default" | "static" | "twilio";
+};
+
 async function request<T>(path: string, init: RequestInit = {}, token?: string): Promise<T> {
   if (!API_URL) throw new Error("VITE_API_URL not configured");
 
@@ -305,6 +311,10 @@ export function sendCallSignal(token: string, input: {
 export async function pullSignals(token: string) {
   const res = await request<{ items: SignalEnvelope[] }>("/v1/calls/signal/pull", {}, token);
   return res.items;
+}
+
+export function getCallIceServers(token: string) {
+  return request<CallIceConfig>("/v1/calls/ice", {}, token);
 }
 
 export function endCall(token: string, callId: string) {

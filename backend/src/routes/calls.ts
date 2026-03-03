@@ -1,6 +1,7 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { store } from "../services/store.js";
+import { resolveCallIceServers } from "../services/turn.js";
 
 const createCallSchema = z.object({
   participants: z.array(z.string().min(4)).min(1).max(8),
@@ -18,6 +19,20 @@ const clearCallHistorySchema = z.object({
 });
 
 export async function callRoutes(app: FastifyInstance): Promise<void> {
+  app.get("/v1/calls/ice", { preHandler: [app.requireAuth] }, async (request, reply) => {
+    try {
+      const result = await resolveCallIceServers();
+      return {
+        iceServers: result.iceServers,
+        ttlSeconds: result.ttlSeconds,
+        source: result.source
+      };
+    } catch (error) {
+      request.log.error({ error }, "failed to resolve call ICE servers");
+      return reply.code(503).send({ error: "Unable to fetch call ICE servers" });
+    }
+  });
+
   app.post("/v1/calls/session", { preHandler: [app.requireAuth] }, async (request, reply) => {
     const parsed = createCallSchema.safeParse(request.body);
     if (!parsed.success) {

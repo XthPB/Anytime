@@ -57,6 +57,11 @@ npm run dev
 - `CORS_ORIGINS` (your mobile/web origins or `*` for early testing)
 - `MAX_INBOX_BATCH` (e.g. `200`)
 - `DATABASE_URL` (from Railway Postgres)
+- TURN for production calls (recommended):
+  - `TURN_PROVIDER=twilio`
+  - `TWILIO_ACCOUNT_SID=AC...`
+  - `TWILIO_AUTH_TOKEN=...`
+  - `TWILIO_TURN_TTL_SECONDS=600`
 5. Deploy. Railway uses `railway.json` + `backend/Dockerfile`.
 6. Optional scripted deploy: `./scripts/deploy-railway-backend.sh`
 7. Optional scripted web deploy: `./scripts/deploy-railway-web.sh`
@@ -97,6 +102,7 @@ cp .env.example .env
 # VITE_TURN_URLS=turn:turn.example.com:3478?transport=udp,turns:turn.example.com:5349?transport=tcp
 # VITE_TURN_USERNAME=<turn-username>
 # VITE_TURN_CREDENTIAL=<turn-password>
+# Note: web now fetches short-lived ICE from backend (/v1/calls/ice) when backend TURN is configured.
 ```
 
 2. Install and run:

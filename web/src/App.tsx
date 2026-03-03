@@ -9,14 +9,15 @@ import {
   clearConversation,
   clearCallHistory,
   createCallSession,
-  createGroup,
-  deleteContact,
-  deleteMessage,
-  deleteMessageByClientId,
+    createGroup,
+    deleteContact,
+    deleteMessage,
+    deleteMessageByClientId,
   editMessage,
   editMessageByClientId,
-  endCall,
-  hideMessage,
+    endCall,
+    getCallIceServers,
+    hideMessage,
   issueIdentityChallenge,
   listInbox,
   listContacts,
@@ -169,6 +170,14 @@ type CallSignalPayload =
   | { type: "webrtc_answer"; sdp: RTCSessionDescriptionInit }
   | { type: "webrtc_ice"; candidate: RTCIceCandidateInit };
 
+type DecodedSignal = {
+  callId: string;
+  fromUserId: string;
+  senderPublicEncryptionKey: string;
+  payload: CallSignalPayload;
+  receivedAtMs: number;
+};
+
 const BASE_SYNC_POLL_MS = 2500;
 const SIGNAL_POLL_IDLE_MS = 1400;
 const SIGNAL_POLL_ACTIVE_MS = 650;
@@ -179,11 +188,14 @@ const GIF_LIMIT = 18;
 const GIF_API_KEY = (import.meta.env.VITE_GIPHY_API_KEY as string | undefined) ?? "dc6zaTOxFJmzC";
 const TENOR_API_KEY = (import.meta.env.VITE_TENOR_API_KEY as string | undefined) ?? "LIVDSRZULELA";
 const CALL_RING_TIMEOUT_MS = 45_000;
-const CALL_RESTART_COOLDOWN_MS = 8_000;
-const CALL_AUDIO_MAX_BITRATE_BPS = 72_000;
+const CALL_RESTART_COOLDOWN_MS = 3_500;
+const CALL_DISCONNECT_GRACE_MS = 4_000;
+const CALL_AUDIO_MAX_BITRATE_BPS = 96_000;
 const CALL_VIDEO_MIN_BITRATE_BPS = 320_000;
 const CALL_VIDEO_START_BITRATE_BPS = 1_200_000;
 const CALL_VIDEO_MAX_BITRATE_BPS = 2_800_000;
+const SIGNAL_QUEUE_TTL_MS = 20_000;
+const SIGNAL_QUEUE_MAX = 256;
 
 interface BeforeInstallPromptEvent extends Event {
   prompt: () => Promise<void>;
@@ -481,12 +493,12 @@ const CALL_VIDEO_MAX_TARGET_BPS = parseNumberEnv(
 function callMediaConstraints(mode: CallMode): MediaStreamConstraints {
   return {
     audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-      channelCount: 2,
-      sampleRate: 48_000,
-      sampleSize: 16
+      echoCancellation: { ideal: true },
+      noiseSuppression: { ideal: true },
+      autoGainControl: { ideal: true },
+      channelCount: { ideal: 1, max: 2 },
+      sampleRate: { ideal: 48_000 },
+      sampleSize: { ideal: 16 }
     },
     video: mode === "video"
       ? {
@@ -638,6 +650,13 @@ function inferMediaPreviewKind(mime: string, src: string): MediaPreviewKind {
   return "unsupported";
 }
 
+function pruneSignalQueue(queue: DecodedSignal[]): DecodedSignal[] {
+  const cutoff = Date.now() - SIGNAL_QUEUE_TTL_MS;
+  const fresh = queue.filter((item) => item.receivedAtMs >= cutoff);
+  if (fresh.length <= SIGNAL_QUEUE_MAX) return fresh;
+  return fresh.slice(fresh.length - SIGNAL_QUEUE_MAX);
+}
+
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [keys, setKeys] = useState<KeyMaterial | null>(null);
@@ -712,9 +731,13 @@ export default function App() {
   const callDurationTimerRef = useRef<number | null>(null);
   const outgoingRingTimeoutRef = useRef<number | null>(null);
   const lastRestartAttemptAtRef = useRef<number>(0);
+  const disconnectRecoveryTimerRef = useRef<number | null>(null);
   const adaptiveVideoBitrateRef = useRef<number>(CALL_VIDEO_START_TARGET_BPS);
   const lastVideoBytesSentRef = useRef<number | null>(null);
   const lastVideoTimestampMsRef = useRef<number | null>(null);
+  const processingSignalsRef = useRef(false);
+  const pendingSignalQueueRef = useRef<DecodedSignal[]>([]);
+  const callIceCacheRef = useRef<{ expiresAtMs: number; iceServers: RTCIceServer[] } | null>(null);
 
   const ownUserId = session?.userId ?? "";
 
@@ -1041,6 +1064,32 @@ export default function App() {
     });
   }, [keys, session]);
 
+  const resolveCallIceServers = useCallback(async (): Promise<RTCIceServer[]> => {
+    const cached = callIceCacheRef.current;
+    if (cached && cached.expiresAtMs > (Date.now() + 15_000)) {
+      return cached.iceServers;
+    }
+
+    if (!session) {
+      return CALL_ICE_SERVERS;
+    }
+
+    try {
+      const result = await getCallIceServers(session.token);
+      if (!Array.isArray(result.iceServers) || result.iceServers.length === 0) {
+        return CALL_ICE_SERVERS;
+      }
+      const ttlMs = Math.max(60_000, Math.min(86_400_000, (result.ttlSeconds || 600) * 1000));
+      callIceCacheRef.current = {
+        iceServers: result.iceServers,
+        expiresAtMs: Date.now() + ttlMs
+      };
+      return result.iceServers;
+    } catch {
+      return CALL_ICE_SERVERS;
+    }
+  }, [session]);
+
   const flushPendingIceCandidates = useCallback(async () => {
     const pc = peerConnectionRef.current;
     if (!pc || !pc.remoteDescription) return;
@@ -1133,12 +1182,17 @@ export default function App() {
         window.clearTimeout(outgoingRingTimeoutRef.current);
         outgoingRingTimeoutRef.current = null;
       }
+      if (disconnectRecoveryTimerRef.current) {
+        window.clearTimeout(disconnectRecoveryTimerRef.current);
+        disconnectRecoveryTimerRef.current = null;
+      }
       callStartAtRef.current = null;
       pendingIceCandidatesRef.current = [];
       lastRestartAttemptAtRef.current = 0;
       adaptiveVideoBitrateRef.current = CALL_VIDEO_START_TARGET_BPS;
       lastVideoBytesSentRef.current = null;
       lastVideoTimestampMsRef.current = null;
+      pendingSignalQueueRef.current = [];
 
       setActiveCall(null);
       setIncomingCall(null);
@@ -1163,11 +1217,16 @@ export default function App() {
     adaptiveVideoBitrateRef.current = CALL_VIDEO_START_TARGET_BPS;
     lastVideoBytesSentRef.current = null;
     lastVideoTimestampMsRef.current = null;
+    if (disconnectRecoveryTimerRef.current) {
+      window.clearTimeout(disconnectRecoveryTimerRef.current);
+      disconnectRecoveryTimerRef.current = null;
+    }
     setRemoteVideoReady(false);
     setLocalVideoReady(false);
+    const runtimeIceServers = await resolveCallIceServers();
 
     const pc = new RTCPeerConnection({
-      iceServers: CALL_ICE_SERVERS,
+      iceServers: runtimeIceServers.length > 0 ? runtimeIceServers : CALL_ICE_SERVERS,
       iceTransportPolicy: CALL_FORCE_RELAY ? "relay" : "all",
       iceCandidatePoolSize: 10,
       bundlePolicy: "max-bundle",
@@ -1212,7 +1271,28 @@ export default function App() {
 
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState;
+      const scheduleRecovery = () => {
+        if (disconnectRecoveryTimerRef.current) return;
+        disconnectRecoveryTimerRef.current = window.setTimeout(() => {
+          disconnectRecoveryTimerRef.current = null;
+          const currentPc = peerConnectionRef.current;
+          if (!currentPc) return;
+          if (currentPc.connectionState === "connected" || currentPc.iceConnectionState === "connected" || currentPc.iceConnectionState === "completed") {
+            return;
+          }
+          setStatus("Recovering call connection...");
+          setActiveCall((prev) => (prev ? { ...prev, status: "connecting" } : prev));
+          restartCallTransport("auto").catch(() => undefined);
+        }, CALL_DISCONNECT_GRACE_MS);
+      };
+      const clearRecoveryTimer = () => {
+        if (!disconnectRecoveryTimerRef.current) return;
+        window.clearTimeout(disconnectRecoveryTimerRef.current);
+        disconnectRecoveryTimerRef.current = null;
+      };
+
       if (state === "connected") {
+        clearRecoveryTimer();
         setActiveCall((prev) => (prev ? { ...prev, status: "active" } : prev));
         if (!callStartAtRef.current) {
           callStartAtRef.current = Date.now();
@@ -1222,22 +1302,52 @@ export default function App() {
       } else if (state === "disconnected") {
         setStatus("Call connection unstable");
         setActiveCall((prev) => (prev ? { ...prev, status: "connecting" } : prev));
-        restartCallTransport("auto").catch(() => undefined);
+        scheduleRecovery();
       } else if (state === "failed") {
+        clearRecoveryTimer();
         setStatus("Call connection failed, retrying...");
         setActiveCall((prev) => (prev ? { ...prev, status: "connecting" } : prev));
         restartCallTransport("auto").catch(() => undefined);
+      } else if (state === "closed") {
+        clearRecoveryTimer();
       }
     };
 
     pc.oniceconnectionstatechange = () => {
       const state = pc.iceConnectionState;
-      if (state === "failed" || state === "disconnected") {
+      if (state === "connected" || state === "completed") {
+        if (disconnectRecoveryTimerRef.current) {
+          window.clearTimeout(disconnectRecoveryTimerRef.current);
+          disconnectRecoveryTimerRef.current = null;
+        }
+        return;
+      }
+      if (state === "failed") {
+        if (disconnectRecoveryTimerRef.current) {
+          window.clearTimeout(disconnectRecoveryTimerRef.current);
+          disconnectRecoveryTimerRef.current = null;
+        }
         restartCallTransport("auto").catch(() => undefined);
+        return;
+      }
+      if (state === "disconnected" && !disconnectRecoveryTimerRef.current) {
+        disconnectRecoveryTimerRef.current = window.setTimeout(() => {
+          disconnectRecoveryTimerRef.current = null;
+          restartCallTransport("auto").catch(() => undefined);
+        }, CALL_DISCONNECT_GRACE_MS);
       }
     };
 
-    const localStream = await navigator.mediaDevices.getUserMedia(callMediaConstraints(params.mode));
+    let localStream: MediaStream;
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia(callMediaConstraints(params.mode));
+    } catch {
+      // Fall back to broad constraints if fine-grained constraints are unsupported.
+      localStream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: params.mode === "video"
+      });
+    }
 
     for (const audioTrack of localStream.getAudioTracks()) {
       audioTrack.contentHint = "speech";
@@ -1267,152 +1377,165 @@ export default function App() {
     }
 
     peerConnectionRef.current = pc;
-  }, [restartCallTransport, sendEncryptedSignal]);
+  }, [resolveCallIceServers, restartCallTransport, sendEncryptedSignal]);
 
   const processSignals = useCallback(async () => {
     if (!session || !keys) return;
+    if (processingSignalsRef.current) return;
+    processingSignalsRef.current = true;
 
-    const signals = await pullSignals(session.token);
+    try {
+      const pulled = await pullSignals(session.token);
+      const decodedSignals: DecodedSignal[] = [];
 
-    for (const signal of signals) {
-      let payload: CallSignalPayload | null = null;
-
-      try {
-        const wrapper = JSON.parse(signal.encryptedPayload) as { ciphertext: string; nonce: string };
-        const plain = decryptPayload({
-          ciphertext: wrapper.ciphertext,
-          nonce: wrapper.nonce,
-          senderPublicKey: signal.senderPublicEncryptionKey,
-          recipientSecretKey: keys.encryptionSecretKey
-        });
-
-        if (!plain) continue;
-        payload = JSON.parse(plain) as CallSignalPayload;
-      } catch {
-        continue;
+      for (const signal of pulled) {
+        try {
+          const wrapper = JSON.parse(signal.encryptedPayload) as { ciphertext: string; nonce: string };
+          const plain = decryptPayload({
+            ciphertext: wrapper.ciphertext,
+            nonce: wrapper.nonce,
+            senderPublicKey: signal.senderPublicEncryptionKey,
+            recipientSecretKey: keys.encryptionSecretKey
+          });
+          if (!plain) continue;
+          decodedSignals.push({
+            callId: signal.callId,
+            fromUserId: signal.fromUserId,
+            senderPublicEncryptionKey: signal.senderPublicEncryptionKey,
+            payload: JSON.parse(plain) as CallSignalPayload,
+            receivedAtMs: Date.now()
+          });
+        } catch {
+          continue;
+        }
       }
 
-      if (!payload) continue;
+      const workQueue = pruneSignalQueue([...pendingSignalQueueRef.current, ...decodedSignals]);
+      const requeue: DecodedSignal[] = [];
+      pendingSignalQueueRef.current = [];
 
-      if (payload.type === "call_invite") {
-        if (activeCall) {
-          await sendEncryptedSignal({
-            toUserId: signal.fromUserId,
-            toPublicKey: signal.senderPublicEncryptionKey,
+      for (const signal of workQueue) {
+        const call = activeCallRef.current;
+
+        if (signal.payload.type === "call_invite") {
+          if (call) {
+            await sendEncryptedSignal({
+              toUserId: signal.fromUserId,
+              toPublicKey: signal.senderPublicEncryptionKey,
+              callId: signal.callId,
+              payload: { type: "call_reject" }
+            });
+            continue;
+          }
+
+          setIncomingCall({
             callId: signal.callId,
-            payload: { type: "call_reject" }
+            fromUserId: signal.fromUserId,
+            fromLabel: resolveUserLabel(signal.fromUserId),
+            senderPublicKey: signal.senderPublicEncryptionKey,
+            mode: signal.payload.mode
           });
+          if (notificationPermission === "granted") {
+            new Notification("Incoming call", {
+              body: `${resolveUserLabel(signal.fromUserId)} is calling (${signal.payload.mode})`,
+              tag: `call-${signal.callId}`
+            });
+          }
           continue;
         }
 
-        setIncomingCall({
-          callId: signal.callId,
-          fromUserId: signal.fromUserId,
-          fromLabel: resolveUserLabel(signal.fromUserId),
-          senderPublicKey: signal.senderPublicEncryptionKey,
-          mode: payload.mode
-        });
-        if (notificationPermission === "granted") {
-          new Notification("Incoming call", {
-            body: `${resolveUserLabel(signal.fromUserId)} is calling (${payload.mode})`,
-            tag: `call-${signal.callId}`
+        if (signal.payload.type === "call_reject") {
+          if (call && call.callId === signal.callId) {
+            setStatus(`${resolveUserLabel(signal.fromUserId)} rejected the call`);
+            cleanupCall(false);
+          }
+          continue;
+        }
+
+        if (signal.payload.type === "call_end") {
+          if (call && call.callId === signal.callId) {
+            setStatus(`${resolveUserLabel(signal.fromUserId)} ended the call`);
+            cleanupCall(false);
+          }
+          continue;
+        }
+
+        if (!call || call.callId !== signal.callId) {
+          requeue.push(signal);
+          continue;
+        }
+
+        const pc = peerConnectionRef.current;
+        if (!pc) {
+          requeue.push(signal);
+          continue;
+        }
+
+        if (signal.payload.type === "call_accept") {
+          if (call.incoming) continue;
+
+          if (outgoingRingTimeoutRef.current) {
+            window.clearTimeout(outgoingRingTimeoutRef.current);
+            outgoingRingTimeoutRef.current = null;
+          }
+
+          applyCodecPreferences(pc, call.mode);
+          await Promise.all(pc.getSenders().map((sender) => (
+            tuneSenderForCall(sender, call.mode, adaptiveVideoBitrateRef.current)
+          )));
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+
+          await sendEncryptedSignal({
+            toUserId: call.peerUserId,
+            toPublicKey: call.peerPublicKey,
+            callId: call.callId,
+            payload: { type: "webrtc_offer", sdp: offer }
           });
-        }
-        continue;
-      }
 
-      if (payload.type === "call_reject") {
-        if (activeCall && activeCall.callId === signal.callId) {
-          setStatus(`${resolveUserLabel(signal.fromUserId)} rejected the call`);
-          cleanupCall(false);
-        }
-        continue;
-      }
-
-      if (payload.type === "call_end") {
-        if (activeCall && activeCall.callId === signal.callId) {
-          setStatus(`${resolveUserLabel(signal.fromUserId)} ended the call`);
-          cleanupCall(false);
-        }
-        continue;
-      }
-
-      if (!activeCall || activeCall.callId !== signal.callId) {
-        continue;
-      }
-
-      if (payload.type === "call_accept") {
-        if (activeCall.incoming) continue;
-
-        if (outgoingRingTimeoutRef.current) {
-          window.clearTimeout(outgoingRingTimeoutRef.current);
-          outgoingRingTimeoutRef.current = null;
+          setActiveCall((prev) => (prev ? { ...prev, status: "connecting" } : prev));
+          continue;
         }
 
-        const pc = peerConnectionRef.current;
-        if (!pc) continue;
+        if (signal.payload.type === "webrtc_offer") {
+          await pc.setRemoteDescription(new RTCSessionDescription(signal.payload.sdp));
+          await flushPendingIceCandidates();
+          applyCodecPreferences(pc, call.mode);
+          await Promise.all(pc.getSenders().map((sender) => (
+            tuneSenderForCall(sender, call.mode, adaptiveVideoBitrateRef.current)
+          )));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
 
-        applyCodecPreferences(pc, activeCall.mode);
-        await Promise.all(pc.getSenders().map((sender) => (
-          tuneSenderForCall(sender, activeCall.mode, adaptiveVideoBitrateRef.current)
-        )));
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
+          await sendEncryptedSignal({
+            toUserId: call.peerUserId,
+            toPublicKey: call.peerPublicKey,
+            callId: call.callId,
+            payload: { type: "webrtc_answer", sdp: answer }
+          });
 
-        await sendEncryptedSignal({
-          toUserId: activeCall.peerUserId,
-          toPublicKey: activeCall.peerPublicKey,
-          callId: activeCall.callId,
-          payload: { type: "webrtc_offer", sdp: offer }
-        });
+          setActiveCall((prev) => (prev ? { ...prev, status: "connecting" } : prev));
+          continue;
+        }
 
-        setActiveCall((prev) => (prev ? { ...prev, status: "connecting" } : prev));
-        continue;
-      }
+        if (signal.payload.type === "webrtc_answer") {
+          await pc.setRemoteDescription(new RTCSessionDescription(signal.payload.sdp));
+          await flushPendingIceCandidates();
+          continue;
+        }
 
-      if (payload.type === "webrtc_offer") {
-        const pc = peerConnectionRef.current;
-        if (!pc) continue;
-
-        await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-        await flushPendingIceCandidates();
-        applyCodecPreferences(pc, activeCall.mode);
-        await Promise.all(pc.getSenders().map((sender) => (
-          tuneSenderForCall(sender, activeCall.mode, adaptiveVideoBitrateRef.current)
-        )));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-
-        await sendEncryptedSignal({
-          toUserId: activeCall.peerUserId,
-          toPublicKey: activeCall.peerPublicKey,
-          callId: activeCall.callId,
-          payload: { type: "webrtc_answer", sdp: answer }
-        });
-
-        setActiveCall((prev) => (prev ? { ...prev, status: "connecting" } : prev));
-        continue;
-      }
-
-      if (payload.type === "webrtc_answer") {
-        const pc = peerConnectionRef.current;
-        if (!pc) continue;
-        await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-        await flushPendingIceCandidates();
-        continue;
-      }
-
-      if (payload.type === "webrtc_ice") {
-        const pc = peerConnectionRef.current;
-        if (!pc) continue;
         if (!pc.remoteDescription) {
-          pendingIceCandidatesRef.current.push(payload.candidate);
+          pendingIceCandidatesRef.current.push(signal.payload.candidate);
         } else {
-          await pc.addIceCandidate(new RTCIceCandidate(payload.candidate)).catch(() => undefined);
+          await pc.addIceCandidate(new RTCIceCandidate(signal.payload.candidate)).catch(() => undefined);
         }
       }
+
+      pendingSignalQueueRef.current = pruneSignalQueue(requeue);
+    } finally {
+      processingSignalsRef.current = false;
     }
-  }, [activeCall, cleanupCall, flushPendingIceCandidates, keys, notificationPermission, resolveUserLabel, sendEncryptedSignal, session]);
+  }, [cleanupCall, flushPendingIceCandidates, keys, notificationPermission, resolveUserLabel, sendEncryptedSignal, session]);
 
   const refreshSessionToken = useCallback(async (baseSession: Session, baseKeys: KeyMaterial): Promise<string> => {
     const { challenge } = await issueIdentityChallenge({
@@ -1587,6 +1710,7 @@ export default function App() {
     knownMessageIdsRef.current = new Set();
     setContactRequests([]);
     setPendingAttachments([]);
+    callIceCacheRef.current = null;
   }, [session?.userId]);
 
   useEffect(() => {

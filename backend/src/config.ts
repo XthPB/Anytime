@@ -10,7 +10,15 @@ const envSchema = z.object({
   JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 characters"),
   CORS_ORIGINS: z.string().default("*"),
   DATABASE_URL: z.string().url(),
-  MAX_INBOX_BATCH: z.coerce.number().int().positive().max(1000).default(200)
+  MAX_INBOX_BATCH: z.coerce.number().int().positive().max(1000).default(200),
+  TURN_PROVIDER: z.enum(["disabled", "static", "twilio"]).default("disabled"),
+  TURN_STATIC_ICE_SERVERS_JSON: z.string().optional(),
+  TURN_URLS: z.string().optional(),
+  TURN_USERNAME: z.string().optional(),
+  TURN_CREDENTIAL: z.string().optional(),
+  TWILIO_ACCOUNT_SID: z.string().optional(),
+  TWILIO_AUTH_TOKEN: z.string().optional(),
+  TWILIO_TURN_TTL_SECONDS: z.coerce.number().int().positive().max(86400).default(600)
 });
 
 const parsed = envSchema.safeParse(process.env);
