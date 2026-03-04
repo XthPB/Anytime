@@ -489,6 +489,12 @@ const CALL_VIDEO_MAX_TARGET_BPS = parseNumberEnv(
   CALL_VIDEO_START_TARGET_BPS,
   6_000_000
 );
+const CALL_AUTO_FORCE_RELAY_ATTEMPTS = parseNumberEnv(
+  import.meta.env.VITE_CALL_AUTO_FORCE_RELAY_ATTEMPTS as string | undefined,
+  2,
+  1,
+  10
+);
 
 function callMediaConstraints(mode: CallMode): MediaStreamConstraints {
   return {
@@ -739,6 +745,8 @@ export default function App() {
   const processingSignalsRef = useRef(false);
   const pendingSignalQueueRef = useRef<DecodedSignal[]>([]);
   const callIceCacheRef = useRef<{ expiresAtMs: number; iceServers: RTCIceServer[] } | null>(null);
+  const autoRecoveryAttemptsRef = useRef(0);
+  const relayFallbackActiveRef = useRef(CALL_FORCE_RELAY);
 
   const ownUserId = session?.userId ?? "";
 
@@ -1116,6 +1124,29 @@ export default function App() {
     lastRestartAttemptAtRef.current = now;
 
     try {
+      let statusLabel = reason === "manual" ? "Reconnecting call..." : "Connection unstable, recovering...";
+      if (reason === "auto") {
+        autoRecoveryAttemptsRef.current += 1;
+        const shouldForceRelay =
+          !CALL_FORCE_RELAY &&
+          !relayFallbackActiveRef.current &&
+          autoRecoveryAttemptsRef.current >= CALL_AUTO_FORCE_RELAY_ATTEMPTS;
+
+        if (shouldForceRelay) {
+          try {
+            const currentConfig = pc.getConfiguration();
+            pc.setConfiguration({
+              ...currentConfig,
+              iceTransportPolicy: "relay"
+            });
+            relayFallbackActiveRef.current = true;
+            statusLabel = "Restrictive network detected, switching to relay path...";
+          } catch {
+            // If runtime switch is unsupported, continue with standard ICE restart.
+          }
+        }
+      }
+
       applyCodecPreferences(pc, call.mode);
       await Promise.all(pc.getSenders().map((sender) => (
         tuneSenderForCall(sender, call.mode, adaptiveVideoBitrateRef.current)
@@ -1128,7 +1159,7 @@ export default function App() {
         callId: call.callId,
         payload: { type: "webrtc_offer", sdp: offer }
       });
-      setStatus(reason === "manual" ? "Reconnecting call..." : "Connection unstable, recovering...");
+      setStatus(statusLabel);
       setActiveCall((prev) => (prev ? { ...prev, status: "connecting" } : prev));
     } catch (error) {
       setStatus(`Reconnect failed: ${(error as Error).message}`);
@@ -1190,6 +1221,8 @@ export default function App() {
       callStartAtRef.current = null;
       pendingIceCandidatesRef.current = [];
       lastRestartAttemptAtRef.current = 0;
+      autoRecoveryAttemptsRef.current = 0;
+      relayFallbackActiveRef.current = CALL_FORCE_RELAY;
       adaptiveVideoBitrateRef.current = CALL_VIDEO_START_TARGET_BPS;
       lastVideoBytesSentRef.current = null;
       lastVideoTimestampMsRef.current = null;
@@ -1215,6 +1248,8 @@ export default function App() {
   }) => {
     peerConnectionRef.current?.close();
     pendingIceCandidatesRef.current = [];
+    autoRecoveryAttemptsRef.current = 0;
+    relayFallbackActiveRef.current = CALL_FORCE_RELAY;
     adaptiveVideoBitrateRef.current = CALL_VIDEO_START_TARGET_BPS;
     lastVideoBytesSentRef.current = null;
     lastVideoTimestampMsRef.current = null;
@@ -1293,6 +1328,7 @@ export default function App() {
       };
 
       if (state === "connected") {
+        autoRecoveryAttemptsRef.current = 0;
         clearRecoveryTimer();
         setActiveCall((prev) => (prev ? { ...prev, status: "active" } : prev));
         if (!callStartAtRef.current) {
@@ -1317,6 +1353,7 @@ export default function App() {
     pc.oniceconnectionstatechange = () => {
       const state = pc.iceConnectionState;
       if (state === "connected" || state === "completed") {
+        autoRecoveryAttemptsRef.current = 0;
         if (disconnectRecoveryTimerRef.current) {
           window.clearTimeout(disconnectRecoveryTimerRef.current);
           disconnectRecoveryTimerRef.current = null;
@@ -2009,10 +2046,16 @@ export default function App() {
         restartCallTransport("manual").catch(() => undefined);
       }
     };
+    const onOffline = () => {
+      setStatus("Network offline. Trying to recover call when connection returns...");
+      setActiveCall((prev) => (prev ? { ...prev, status: "connecting" } : prev));
+    };
 
     window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
     return () => {
       window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
     };
   }, [activeCall, restartCallTransport]);
 

@@ -14,6 +14,8 @@ type TurnResponse = {
   source: "default" | "static" | "twilio" | "coturn" | "cloudflare";
 };
 
+type ManagedProvider = "cloudflare" | "twilio" | "coturn" | "static";
+
 const DEFAULT_ICE_SERVERS: IceServerConfig[] = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
@@ -22,6 +24,8 @@ const DEFAULT_ICE_SERVERS: IceServerConfig[] = [
 
 const TWILIO_REFRESH_BUFFER_MS = 30_000;
 const CLOUDFLARE_REFRESH_BUFFER_MS = 20_000;
+const TURN_HTTP_TIMEOUT_MS = 4_500;
+const TURN_HTTP_RETRIES = 2;
 
 let cachedTwilio: { expiresAtMs: number; response: TurnResponse } | null = null;
 const cachedCloudflareByUser = new Map<string, { expiresAtMs: number; response: TurnResponse }>();
@@ -41,6 +45,58 @@ function sanitizeIceServers(input: unknown): IceServerConfig[] {
     const urls = Array.isArray(candidate.urls) ? candidate.urls : [candidate.urls];
     return urls.some((url) => typeof url === "string" && url.trim().length > 0);
   });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function shouldRetryStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function shouldRetryError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.name === "AbortError" || /network|fetch|timeout/i.test(error.message);
+}
+
+async function fetchTurnJsonWithRetry<T>(input: string, init: RequestInit): Promise<T> {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt <= TURN_HTTP_RETRIES; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), TURN_HTTP_TIMEOUT_MS);
+    try {
+      const response = await fetch(input, {
+        ...init,
+        signal: controller.signal
+      });
+
+      if (!response.ok) {
+        if (attempt < TURN_HTTP_RETRIES && shouldRetryStatus(response.status)) {
+          await sleep(160 * (attempt + 1));
+          continue;
+        }
+        throw new Error(`TURN provider HTTP ${response.status}`);
+      }
+
+      return await response.json() as T;
+    } catch (error) {
+      lastError = error;
+      if (attempt < TURN_HTTP_RETRIES && shouldRetryError(error)) {
+        await sleep(180 * (attempt + 1));
+        continue;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("TURN provider request failed");
 }
 
 function staticIceResponse(): TurnResponse | null {
@@ -125,27 +181,33 @@ async function twilioIceResponse(): Promise<TurnResponse | null> {
 
   const auth = Buffer.from(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`).toString("base64");
   const body = new URLSearchParams({ Ttl: String(env.TWILIO_TURN_TTL_SECONDS) });
-  const response = await fetch(
-    `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(env.TWILIO_ACCOUNT_SID)}/Tokens.json`,
-    {
-      method: "POST",
-      headers: {
-        authorization: `Basic ${auth}`,
-        "content-type": "application/x-www-form-urlencoded"
-      },
-      body
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error(`TURN provider HTTP ${response.status}`);
-  }
-
-  const payload = await response.json() as {
+  let payload: {
     ice_servers?: IceServerConfig[];
     ttl?: number | string;
     date_expires?: string;
   };
+  try {
+    payload = await fetchTurnJsonWithRetry<{
+      ice_servers?: IceServerConfig[];
+      ttl?: number | string;
+      date_expires?: string;
+    }>(
+      `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(env.TWILIO_ACCOUNT_SID)}/Tokens.json`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Basic ${auth}`,
+          "content-type": "application/x-www-form-urlencoded"
+        },
+        body
+      }
+    );
+  } catch (error) {
+    if (cachedTwilio && cachedTwilio.expiresAtMs > now + 1_000) {
+      return cachedTwilio.response;
+    }
+    throw error;
+  }
 
   const servers = sanitizeIceServers(payload.ice_servers);
   if (servers.length === 0) {
@@ -182,27 +244,33 @@ async function cloudflareIceResponse(userId: string): Promise<TurnResponse | nul
     return cached.response;
   }
 
-  const response = await fetch(
-    `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(env.CF_TURN_KEY_ID)}/credentials/generate-ice-servers`,
-    {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${env.CF_TURN_API_TOKEN}`,
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({ ttl: env.CF_TURN_TTL_SECONDS })
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error(`TURN provider HTTP ${response.status}`);
-  }
-
-  const payload = await response.json() as {
+  let payload: {
     iceServers?: IceServerConfig[];
     ice_servers?: IceServerConfig[];
     ttl?: number | string;
   };
+  try {
+    payload = await fetchTurnJsonWithRetry<{
+      iceServers?: IceServerConfig[];
+      ice_servers?: IceServerConfig[];
+      ttl?: number | string;
+    }>(
+      `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(env.CF_TURN_KEY_ID)}/credentials/generate-ice-servers`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${env.CF_TURN_API_TOKEN}`,
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({ ttl: env.CF_TURN_TTL_SECONDS })
+      }
+    );
+  } catch (error) {
+    if (cached && cached.expiresAtMs > now + 1_000) {
+      return cached.response;
+    }
+    throw error;
+  }
 
   const servers = sanitizeIceServers(payload.iceServers ?? payload.ice_servers);
   if (servers.length === 0) {
@@ -223,25 +291,29 @@ async function cloudflareIceResponse(userId: string): Promise<TurnResponse | nul
   return result;
 }
 
+async function resolveProvider(provider: ManagedProvider, userId: string): Promise<TurnResponse | null> {
+  if (provider === "cloudflare") return cloudflareIceResponse(userId);
+  if (provider === "twilio") return twilioIceResponse();
+  if (provider === "coturn") return coturnIceResponse(userId);
+  return staticIceResponse();
+}
+
+function orderedProviders(primary: ManagedProvider | "disabled"): ManagedProvider[] {
+  const base: ManagedProvider[] = ["cloudflare", "twilio", "coturn", "static"];
+  if (primary === "disabled") return [];
+  return [primary, ...base.filter((item) => item !== primary)];
+}
+
 export async function resolveCallIceServers(userId: string): Promise<TurnResponse> {
-  if (env.TURN_PROVIDER === "cloudflare") {
-    const cloudflare = await cloudflareIceResponse(userId);
-    if (cloudflare) return cloudflare;
-  }
-
-  if (env.TURN_PROVIDER === "twilio") {
-    const twilio = await twilioIceResponse();
-    if (twilio) return twilio;
-  }
-
-  if (env.TURN_PROVIDER === "coturn") {
-    const coturn = coturnIceResponse(userId);
-    if (coturn) return coturn;
-  }
-
-  if (env.TURN_PROVIDER === "static") {
-    const staticConfig = staticIceResponse();
-    if (staticConfig) return staticConfig;
+  const providers = orderedProviders(env.TURN_PROVIDER);
+  for (const provider of providers) {
+    try {
+      const result = await resolveProvider(provider, userId);
+      if (result) return result;
+    } catch {
+      // Try configured fallback providers before giving up.
+      continue;
+    }
   }
 
   return {
