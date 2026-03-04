@@ -11,7 +11,7 @@ const envSchema = z.object({
   CORS_ORIGINS: z.string().default("*"),
   DATABASE_URL: z.string().url(),
   MAX_INBOX_BATCH: z.coerce.number().int().positive().max(1000).default(200),
-  TURN_PROVIDER: z.enum(["disabled", "static", "twilio", "coturn"]).default("disabled"),
+  TURN_PROVIDER: z.enum(["disabled", "static", "twilio", "coturn", "cloudflare"]).default("disabled"),
   TURN_STATIC_ICE_SERVERS_JSON: z.string().optional(),
   TURN_URLS: z.string().optional(),
   TURN_USERNAME: z.string().optional(),
@@ -19,6 +19,9 @@ const envSchema = z.object({
   TURN_COTURN_SHARED_SECRET: z.string().optional(),
   TURN_COTURN_TTL_SECONDS: z.coerce.number().int().positive().max(86400).default(600),
   TURN_COTURN_USER_PREFIX: z.string().default("u"),
+  CF_TURN_KEY_ID: z.string().optional(),
+  CF_TURN_API_TOKEN: z.string().optional(),
+  CF_TURN_TTL_SECONDS: z.coerce.number().int().positive().max(864000).default(86400),
   TWILIO_ACCOUNT_SID: z.string().optional(),
   TWILIO_AUTH_TOKEN: z.string().optional(),
   TWILIO_TURN_TTL_SECONDS: z.coerce.number().int().positive().max(86400).default(600)
@@ -53,6 +56,23 @@ const envSchema = z.object({
         code: z.ZodIssueCode.custom,
         path: ["TURN_COTURN_SHARED_SECRET"],
         message: "Required when TURN_PROVIDER=coturn"
+      });
+    }
+  }
+
+  if (input.TURN_PROVIDER === "cloudflare") {
+    if (!input.CF_TURN_KEY_ID) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["CF_TURN_KEY_ID"],
+        message: "Required when TURN_PROVIDER=cloudflare"
+      });
+    }
+    if (!input.CF_TURN_API_TOKEN) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["CF_TURN_API_TOKEN"],
+        message: "Required when TURN_PROVIDER=cloudflare"
       });
     }
   }

@@ -11,7 +11,7 @@ type IceServerConfig = {
 type TurnResponse = {
   iceServers: IceServerConfig[];
   ttlSeconds: number;
-  source: "default" | "static" | "twilio" | "coturn";
+  source: "default" | "static" | "twilio" | "coturn" | "cloudflare";
 };
 
 const DEFAULT_ICE_SERVERS: IceServerConfig[] = [
@@ -21,8 +21,10 @@ const DEFAULT_ICE_SERVERS: IceServerConfig[] = [
 ];
 
 const TWILIO_REFRESH_BUFFER_MS = 30_000;
+const CLOUDFLARE_REFRESH_BUFFER_MS = 20_000;
 
 let cachedTwilio: { expiresAtMs: number; response: TurnResponse } | null = null;
+const cachedCloudflareByUser = new Map<string, { expiresAtMs: number; response: TurnResponse }>();
 
 function parseTurnUrlsCsv(raw: string | undefined): string[] {
   return (raw ?? "")
@@ -169,7 +171,64 @@ async function twilioIceResponse(): Promise<TurnResponse | null> {
   return result;
 }
 
+async function cloudflareIceResponse(userId: string): Promise<TurnResponse | null> {
+  if (!env.CF_TURN_KEY_ID || !env.CF_TURN_API_TOKEN) {
+    return null;
+  }
+
+  const now = Date.now();
+  const cached = cachedCloudflareByUser.get(userId);
+  if (cached && cached.expiresAtMs > now + CLOUDFLARE_REFRESH_BUFFER_MS) {
+    return cached.response;
+  }
+
+  const response = await fetch(
+    `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(env.CF_TURN_KEY_ID)}/credentials/generate-ice-servers`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${env.CF_TURN_API_TOKEN}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ ttl: env.CF_TURN_TTL_SECONDS })
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`TURN provider HTTP ${response.status}`);
+  }
+
+  const payload = await response.json() as {
+    iceServers?: IceServerConfig[];
+    ice_servers?: IceServerConfig[];
+    ttl?: number | string;
+  };
+
+  const servers = sanitizeIceServers(payload.iceServers ?? payload.ice_servers);
+  if (servers.length === 0) {
+    throw new Error("TURN provider returned no ICE servers");
+  }
+
+  const ttlValue = Number(payload.ttl);
+  const ttl = Number.isFinite(ttlValue) && ttlValue > 0 ? Math.floor(ttlValue) : env.CF_TURN_TTL_SECONDS;
+  const result: TurnResponse = {
+    iceServers: servers,
+    ttlSeconds: ttl,
+    source: "cloudflare"
+  };
+  cachedCloudflareByUser.set(userId, {
+    expiresAtMs: now + (ttl * 1000),
+    response: result
+  });
+  return result;
+}
+
 export async function resolveCallIceServers(userId: string): Promise<TurnResponse> {
+  if (env.TURN_PROVIDER === "cloudflare") {
+    const cloudflare = await cloudflareIceResponse(userId);
+    if (cloudflare) return cloudflare;
+  }
+
   if (env.TURN_PROVIDER === "twilio") {
     const twilio = await twilioIceResponse();
     if (twilio) return twilio;

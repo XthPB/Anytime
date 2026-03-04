@@ -58,12 +58,17 @@ npm run dev
 - `MAX_INBOX_BATCH` (e.g. `200`)
 - `DATABASE_URL` (from Railway Postgres)
 - TURN for production calls (required for high reliability):
-  - option A (managed vendor):
+  - option A (managed Cloudflare TURN, no VPS):
+  - `TURN_PROVIDER=cloudflare`
+  - `CF_TURN_KEY_ID=<cloudflare_turn_key_id>`
+  - `CF_TURN_API_TOKEN=<cloudflare_turn_key_api_token>`
+  - `CF_TURN_TTL_SECONDS=86400`
+  - option B (managed vendor):
   - `TURN_PROVIDER=twilio`
   - `TWILIO_ACCOUNT_SID=AC...`
   - `TWILIO_AUTH_TOKEN=...`
   - `TWILIO_TURN_TTL_SECONDS=600`
-  - option B (self-hosted Coturn, no TURN vendor):
+  - option C (self-hosted Coturn, no TURN vendor):
   - `TURN_PROVIDER=coturn`
   - `TURN_URLS=turn:turn.your-domain.com:3478?transport=udp,turn:turn.your-domain.com:3478?transport=tcp,turns:turn.your-domain.com:5349?transport=tcp`
   - `TURN_COTURN_SHARED_SECRET=<long-random-secret>`
@@ -74,6 +79,8 @@ npm run dev
 7. Optional scripted web deploy: `./scripts/deploy-railway-web.sh`
 8. Optional scripted TURN env wiring for self-hosted Coturn:
    - `./scripts/configure-railway-coturn.sh` (uses `TURN_DOMAIN` + `TURN_COTURN_SHARED_SECRET`)
+9. Optional scripted TURN env wiring for Cloudflare TURN:
+   - `./scripts/configure-railway-cloudflare-turn.sh` (uses `CF_TURN_KEY_ID` + `CF_TURN_API_TOKEN`)
 
 ## Mobile Run (iOS + Android)
 
@@ -135,7 +142,18 @@ For production-grade security you should still add:
 
 - X3DH + Double Ratchet (forward secrecy and better compromise recovery).
 - Independent security audit and penetration testing.
-- Dedicated TURN + media infrastructure (for example your own Coturn + short-lived credentials from backend).
+- Dedicated TURN + media infrastructure (for example Cloudflare TURN or your own Coturn + short-lived credentials from backend).
+
+## Managed TURN (Cloudflare)
+
+If you want reliable TURN without managing VPS/DNS/UDP firewall, use Cloudflare TURN with:
+- `TURN_PROVIDER=cloudflare`
+- `CF_TURN_KEY_ID`
+- `CF_TURN_API_TOKEN`
+
+Backend fetches short-lived ICE servers from Cloudflare and serves them through `/v1/calls/ice`.
+
+See `docs/turn-cloudflare-managed.md` for setup.
 
 ## Self-Hosted TURN (Coturn)
 
